@@ -406,7 +406,7 @@ namespace EmonTool
                 {
                     entry.PackedSize = (uint)(imgData.Length - 32);
                 }
-                entry.UnpackedSize = entry.PackedSize;
+                entry.UnpackedSize = file.Length;
 
                 // Validate sizes
                 if (entry.PackedSize > int.MaxValue)
@@ -421,4 +421,5 @@ namespace EmonTool
         }
     }
 }
+
 
