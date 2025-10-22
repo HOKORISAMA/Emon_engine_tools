@@ -419,28 +419,6 @@ namespace EmonTool
                 throw new InvalidOperationException($"Failed to pack BMP file: {file.Name}", ex);
             }
         }
-
-        // Custom exceptions for better error handling
-        public class EmeFormatException : Exception
-        {
-            public EmeFormatException(string message) : base(message) { }
-            public EmeFormatException(string message, Exception innerException)
-                : base(message, innerException) { }
-        }
-
-        public class EmeCompressionException : Exception
-        {
-            public EmeCompressionException(string message) : base(message) { }
-            public EmeCompressionException(string message, Exception innerException)
-                : base(message, innerException) { }
-        }
-
-        public class EmeEncryptionException : Exception
-        {
-            public EmeEncryptionException(string message) : base(message) { }
-            public EmeEncryptionException(string message, Exception innerException)
-                : base(message, innerException) { }
-        }
     }
-
 }
+
