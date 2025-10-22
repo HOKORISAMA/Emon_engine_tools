@@ -420,84 +420,6 @@ namespace EmonTool
             }
         }
 
-        // Utility methods for validation
-        private bool ValidateHeader(byte[] header, string fileName, int expectedSize)
-        {
-            if (header == null || header.Length < expectedSize)
-            {
-                throw new InvalidDataException($"Invalid header size for file: {fileName}");
-            }
-            return true;
-        }
-
-        private bool ValidateFileSize(long size, string fileName)
-        {
-            if (size <= 0 || size > int.MaxValue)
-            {
-                throw new InvalidDataException($"Invalid file size for: {fileName}");
-            }
-            return true;
-        }
-
-        private bool ValidateOffset(long offset, long fileSize, string fileName)
-        {
-            if (offset < 0 || offset >= fileSize)
-            {
-                throw new InvalidDataException($"Invalid offset for file: {fileName}");
-            }
-            return true;
-        }
-
-        private string SanitizeFileName(string fileName)
-        {
-            if (string.IsNullOrEmpty(fileName))
-                return "_unnamed_";
-
-            // Remove invalid characters
-            string invalid = new string(Path.GetInvalidFileNameChars());
-            foreach (char c in invalid)
-            {
-                fileName = fileName.Replace(c.ToString(), "_");
-            }
-
-            // Ensure the filename isn't too long
-            if (fileName.Length > 255)
-                fileName = fileName.Substring(0, 255);
-
-            return fileName;
-        }
-
-        private void EnsureDirectoryExists(string path)
-        {
-            string directory = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
-            {
-                try
-                {
-                    Directory.CreateDirectory(directory);
-                }
-                catch (Exception ex)
-                {
-                    throw new IOException($"Failed to create directory: {directory}", ex);
-                }
-            }
-        }
-
-        private void ValidateEntryBasics(Utils.Entry entry)
-        {
-            if (entry == null)
-                throw new ArgumentNullException(nameof(entry));
-
-            if (string.IsNullOrEmpty(entry.Name))
-                throw new InvalidDataException("Entry name cannot be null or empty");
-
-            if (entry.PackedSize > int.MaxValue)
-                throw new InvalidDataException($"Packed size too large for entry: {entry.Name}");
-
-            if (entry.UnpackedSize > int.MaxValue)
-                throw new InvalidDataException($"Unpacked size too large for entry: {entry.Name}");
-        }
-
         // Custom exceptions for better error handling
         public class EmeFormatException : Exception
         {
@@ -520,4 +442,5 @@ namespace EmonTool
                 : base(message, innerException) { }
         }
     }
+
 }
