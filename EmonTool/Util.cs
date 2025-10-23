@@ -1,161 +1,128 @@
-﻿using System;
+using System;
 using System.Text;
 
 namespace EmonTool
 {
-    internal class Utils
+	public class Entry
+	{
+		public string Name { get; set; } = String.Empty;
+		public string Path { get; set; } = String.Empty;
+		public uint Offset { get; set; }
+		public uint PackedSize { get; set; }
+		public uint UnpackedSize { get; set; }
+		public int LzssFrameSize { get; set; }
+		public int LzssInitPos { get; set; }
+		public int SubType { get; set; }
+		public uint Magic { get; set; }
+		public bool IsPacked { get; set; } = true;
+	}
+
+	public class EmeMetaData
+	{
+		public int Bpp { get; set; }
+		public int Width { get; set; }
+		public int Height { get; set; }   
+		public int Colors { get; set; }  
+		public int Stride { get; set; }
+		public int OffsetX { get; set; }
+		public int OffsetY { get; set; }   
+	}
+	
+    public class Utils
     {
-        public class Entry
-        {
-            public string Name { get; set; }
-            public string Path { get; set; }
-            public uint Offset { get; set; }
-            public uint PackedSize { get; set; }
-            public uint UnpackedSize { get; set; }
-            public int LzssFrameSize { get; set; }
-            public int LzssInitPos { get; set; }
-            public int SubType { get; set; }
-            public uint Magic { get; set; }
-            public bool IsPacked { get; set; } = true;
-        }
-        public static byte[] ApplyXorMask(byte[] data)
-        {
-            byte[] xorMask = StringToByteArray("ca96e2f800000000");
-            byte[] transformedData = new byte[data.Length];
+		public static unsafe void Encrypt(byte[] buffer, int offset, int length, byte[] routine)
+		{
+			if (buffer == null)
+				throw new ArgumentNullException(nameof(buffer));
+			if (offset < 0)
+				throw new ArgumentOutOfRangeException(nameof(offset));
+			if (buffer.Length - offset < length)
+				throw new ArgumentException("Buffer offset and length are out of bounds.");
 
-            for (int i = 0; i < data.Length; i++)
-            {
-                transformedData[i] = (byte)(data[i] ^ xorMask[i % xorMask.Length]);
-            }
+			fixed (byte* data8 = &buffer[offset])
+			{
+				uint* data32 = (uint*)data8;
+				int length32 = length / 4;
 
-            return transformedData;
-        }
+				for (int i = 0; i < 8; i++)
+				{
+					byte op = routine[i];
+					uint key = BitConverter.ToUInt32(routine, 8 + i * 4);
 
-        public static byte[] ApplyHeaderXorMask(byte[] data)
-        {
-            byte[] xorMask = StringToByteArray("ca0000f8009600000000e200");
-            byte[] transformedData = new byte[data.Length];
+					switch (op)
+					{
+						case 1: // Simple XOR (self-inverse)
+							for (int j = 0; j < length32; j++)
+								data32[j] ^= key;
+							break;
 
-            for (int i = 0; i < data.Length; i++)
-            {
-                transformedData[i] = (byte)(data[i] ^ xorMask[i % xorMask.Length]);
-            }
+						case 2: // Chained XOR (forward version)
+							{
+								uint prev = key;
+								for (int j = 0; j < length32; j++)
+								{
+									uint v = data32[j];
+									uint enc = v ^ prev;
+									data32[j] = enc;
+									prev = enc;
+								}
+							}
+							break;
 
-            return transformedData;
-        }
-        public static byte[] StringToByteArray(string hex)
-        {
-            int numberChars = hex.Length;
-            byte[] bytes = new byte[numberChars / 2];
-            for (int i = 0; i < numberChars; i += 2)
-            {
-                bytes[i / 2] = Convert.ToByte(hex.Substring(i, 2), 16);
-            }
-            return bytes;
-        }
-        public static byte[] Encrypt(byte[] buffer, int offset, int length, byte[] routine)
-        {
-            byte[] data = new byte[length];
-            Array.Copy(buffer, offset, data, 0, length);
+						case 4: // Bit shift forward
+							for (int j = 0; j < length32; j++)
+								data32[j] = (uint)ShiftValueEncrypt(data32[j], key);
+							break;
 
-            for (int i = 0; i < 8; i++)
-            {
-                uint key = BitConverter.ToUInt32(routine, 8 + i * 4);
+						case 8: // Table permutation forward
+							TablePermuteEncrypt(buffer, offset, length, key);
+							break;
+					}
+				}
+			}
+		}
 
-                switch (routine[i])
-                {
-                    case 1:
-                        for (int j = 0; j < data.Length; j += 4)
-                        {
-                            uint v = BitConverter.ToUInt32(data, j);
-                            BitConverter.GetBytes(v ^ key).CopyTo(data, j);
-                        }
-                        break;
+		private static int ShiftValueEncrypt(uint val, uint key)
+		{
+			// Build inverse mapping for encryption
+			int[] forwardMap = new int[32];
+			int shift = 0;
+			for (int i = 0; i < 32; i++)
+			{
+				shift += (int)key;
+				forwardMap[i] = shift % 32;
+			}
 
-                    case 2:
-                        uint prev = 0;
-                        for (int j = 0; j < data.Length; j += 4)
-                        {
-                            uint v = BitConverter.ToUInt32(data, j);
-                            uint newVal = v ^ key ^ prev;
-                            BitConverter.GetBytes(newVal).CopyTo(data, j);
-                            prev = newVal;
-                        }
-                        break;
+			int[] inverseMap = new int[32];
+			for (int i = 0; i < 32; i++)
+				inverseMap[forwardMap[i]] = i;
 
-                    case 4:
-                        for (int j = 0; j < data.Length; j += 4)
-                        {
-                            uint v = BitConverter.ToUInt32(data, j);
-                            int result = RevShiftValue(v, key);
-                            BitConverter.GetBytes(result).CopyTo(data, j);
-                        }
-                        break;
+			uint result = 0;
+			for (int i = 0; i < 32; i++)
+			{
+				uint bit = (val >> i) & 1;
+				result |= bit << inverseMap[i];
+			}
 
-                    case 8:
-                        RevInitTable(data, key);
-                        break;
-                }
-            }
+			return (int)result;
+		}
 
-            return data;
-        }
-        private static int RevShiftValue(uint result, uint key)
-        {
-            uint originalValue = 0;
-            int shift = 0;
+		private static void TablePermuteEncrypt(byte[] buffer, int offset, int length, uint key)
+		{
+			if (length == 0) return;
 
-            for (int i = 0; i < 32; i++)
-            {
-                shift += (int)key;
-                int originalPosition = shift % 32;
-                uint bit = (result >> originalPosition) & 1;
-                originalValue |= (bit << i);
-            }
+			byte[] table = new byte[length];
+			int x = 0;
+			for (int i = 0; i < length; i++)
+			{
+				x = (int)((x + key) % length);
+				table[i] = buffer[offset + x];
+			}
 
-            return (int)originalValue;
-        }
+			Buffer.BlockCopy(table, 0, buffer, offset, length);
+		}
 
-        private static void RevInitTable(Span<byte> buffer, uint key)
-        {
-            int length = buffer.Length;
-            byte[] table = new byte[length];
 
-            int[] xSequence = new int[length];
-            int currentX = 0;
-
-            for (int i = 0; i < length; i++)
-            {
-                currentX = (int)((currentX + key) % length);
-                xSequence[i] = currentX;
-            }
-
-            int[] invXSequence = new int[length];
-            for (int i = 0; i < xSequence.Length; i++)
-            {
-                invXSequence[xSequence[i]] = i;
-            }
-
-            for (int i = 0; i < length; i++)
-            {
-                table[invXSequence[i]] = buffer[i];
-            }
-
-            table.CopyTo(buffer);
-        }
-
-        public static byte[] ApplyImageHeaderXorMask(byte[] data)
-        {
-            byte[] xorMask = Convert.FromHexString("ca96e2d0000000a89f96e27800000000cb82e2f800140000ca86c8f800000000");
-            byte[] transformedData = new byte[data.Length];
-
-            for (int i = 0; i < data.Length; i++)
-            {
-                transformedData[i] = (byte)(data[i] ^ xorMask[i % xorMask.Length]);
-            }
-
-            return transformedData;
-        }
         internal static unsafe void Decrypt(byte[] buffer, int offset, int length, byte[] routine)
         {
             if (null == buffer)
@@ -242,6 +209,7 @@ namespace EmonTool
             }
             Buffer.BlockCopy(table, 0, buffer, offset, length);
         }
+
         public static string GetNullTerminatedString(byte[] data, int offset, int maxLength)
         {
             int end = Array.IndexOf(data, (byte)0, offset, maxLength);
@@ -250,6 +218,5 @@ namespace EmonTool
 
             return Encoding.UTF8.GetString(data, offset, end - offset);
         }
-
     }
 }
