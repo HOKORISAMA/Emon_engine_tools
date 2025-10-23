@@ -1,13 +1,13 @@
-﻿using SixLabors.ImageSharp;
+using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
-using Utility.Compression;
+using Compression;
 
 namespace EmonTool
 {
-    internal class CRBMP
+    internal class CrBmp
     {
-        private const int HEADER_SIZE = 32;
+        private const int HeaderSize = 32;
 
         internal static byte[] EncodeImage(Image image)
         {
@@ -72,9 +72,6 @@ namespace EmonTool
                 BitConverter.GetBytes((short)image.Height).CopyTo(header, 4);
                 BitConverter.GetBytes((short)0).CopyTo(header, 6);
                 BitConverter.GetBytes(stride).CopyTo(header, 8);
-
-                //header = Utils.Encrypt(header, 0, header.Length, key);
-                //header = Utils.ApplyImageHeaderXorMask(header);
 
                 byte[] data = new byte[header.Length + compressedData.Length];
                 Array.Copy(header, data, header.Length);
