@@ -20,8 +20,9 @@
 
 using System;
 using System.IO;
+using System.IO.Compression;
 
-namespace Utility.Compression
+namespace Compression
 {
     public class Lzss
     {
@@ -334,3 +335,4 @@ namespace Utility.Compression
         }
     }
 }
+
