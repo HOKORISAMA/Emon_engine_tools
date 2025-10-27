@@ -1,85 +1,99 @@
-#STILL NEEDS A LITTLE IMPROVEMENT
-
 import os
 import json
 import struct
 import argparse
 from typing import List, Dict
-from lzss import compress, LZSSError
+import lzss
 
 class EmePacker:
     def __init__(self):
         self.signature = b"RREDATA "
         
-    def shift_value(self, result: int, key: int) -> int:
-        original_value = 0
-        shift = 0
-        for i in range(32):
-            shift += key
-            original_position = shift % 32
-            bit = (result >> original_position) & 1
-            original_value |= (bit << i)
-        return original_value
-
-    def init_table(self, buffer: memoryview, key: int) -> None:
-        length = len(buffer)
-        table = bytearray(length)
-        
-        # Compute the x sequence first
-        x_sequence = [0] * length
-        current_x = 0
-        for i in range(length):
-            current_x = (current_x + key) % length
-            x_sequence[i] = current_x
-        
-        # Reverse mapping
-        inv_x_sequence = [0] * length
-        for i, x in enumerate(x_sequence):
-            inv_x_sequence[x] = i
-        
-        # Reconstruct the original buffer
-        for i in range(length):
-            table[inv_x_sequence[i]] = buffer[i]
-        
-        buffer[:] = table
-
     def encrypt(self, buffer: bytearray, offset: int, length: int, routine: bytes) -> bytearray:
         data = bytearray(buffer[offset:offset + length])
-        data_view = memoryview(data)
-        
-        for i in range(0, 8):
-            key = struct.unpack_from("<I", routine, 8 + i * 4)[0]
-            if routine[i] == 1:
-                for j in range(0, len(data), 4):
-                    v = struct.unpack_from("<I", data_view, j)[0]
-                    struct.pack_into("<I", data_view, j, v ^ key)
-                    
-            elif routine[i] == 2:
-                prev = 0
-                for j in range(0, len(data), 4):
-                    v = struct.unpack_from("<I", data_view, j)[0]
-                    new_val = v ^ key ^ prev
-                    struct.pack_into("<I", data_view, j, new_val)
-                    prev = new_val
+        view = memoryview(data)
 
-            elif routine[i] == 4:
-                for j in range(0, len(data), 4):
-                    v = struct.unpack_from("<I", data_view, j)[0]
-                    result = self.shift_value(v, key)
-                    struct.pack_into("<I", data_view, j, result)
+        # Apply operations in REVERSE order of decryptor (0 to 7) with forward operations
+        for i in range(8):
+            op = routine[i]
+            # Get the key from the same position as decryptor but in forward order
+            key_index = 8 + i * 4
+            key = struct.unpack_from("<I", routine, key_index)[0]
 
-            elif routine[i] == 8:
-                self.init_table(data, key)
-                    
+            if op == 1:
+                # Simple XOR (self-inverse)
+                for j in range(0, len(data), 4):
+                    if j + 4 <= len(data):
+                        v = struct.unpack_from("<I", view, j)[0]
+                        struct.pack_into("<I", view, j, v ^ key)
+
+            elif op == 2:
+                # Reverse chained XOR - match decryptor's behavior exactly
+                # For encryption: current = plain ^ previous_encrypted
+                prev = key
+                for j in range(0, len(data), 4):
+                    if j + 4 <= len(data):
+                        v = struct.unpack_from("<I", view, j)[0]
+                        enc = v ^ prev
+                        struct.pack_into("<I", view, j, enc)
+                        prev = enc
+
+            elif op == 4:
+                # Bit shift - use proper forward operation
+                for j in range(0, len(data), 4):
+                    if j + 4 <= len(data):
+                        v = struct.unpack_from("<I", view, j)[0]
+                        struct.pack_into("<I", view, j, self.shift_value_encrypt(v, key))
+
+            elif op == 8:
+                # Table permutation - use proper forward operation  
+                self.table_permute_encrypt(data, key)
+
         return data
 
-    def apply_xor_mask(self, data: bytearray) -> bytearray:
-        xor_mask = bytes.fromhex("ca96e2f800000000")
-        transformed_data = bytearray(len(data))
-        for i in range(len(data)):
-            transformed_data[i] = data[i] ^ xor_mask[i % len(xor_mask)]
-        return transformed_data
+    def shift_value_encrypt(self, val: int, key: int) -> int:
+        # The decryptor does: for each bit i, move it to position (accumulated_shift % 32)
+        # where accumulated_shift = (i+1) * key
+        # So we need to reverse this mapping
+        
+        # First, calculate where each bit would end up in the decryptor
+        decryptor_positions = []
+        shift = 0
+        for i in range(32):
+            shift = (shift + key) % 32
+            decryptor_positions.append(shift)
+        
+        # Now create the inverse mapping for encryption
+        # For each position in the output, which input bit should go there?
+        encryptor_mapping = [0] * 32
+        for original_bit_position in range(32):
+            target_position = decryptor_positions[original_bit_position]
+            encryptor_mapping[target_position] = original_bit_position
+        
+        # Apply the inverse mapping
+        result = 0
+        for output_position in range(32):
+            input_bit_position = encryptor_mapping[output_position]
+            bit = (val >> output_position) & 1
+            result |= (bit << input_bit_position)
+            
+        return result
 
+    def table_permute_encrypt(self, buffer: bytearray, key: int) -> None:
+        # The decryptor's table operation is: table[x] = buffer[i] where x = (x + key) % length
+        # The inverse operation for encryption is: table[i] = buffer[x] where x = (x + key) % length
+        length = len(buffer)
+        if length == 0:
+            return
+        
+        # Build the same sequence as decryptor but use it for gathering instead of scattering
+        table = bytearray(length)
+        x = 0
+        for i in range(length):
+            x = (x + key) % length
+            table[i] = buffer[x]
+        buffer[:] = table
+        
     def create_archive(self, input_dir: str, json_path: str, output_path: str) -> bool:
         try:
             with open(json_path, 'r') as f:
@@ -87,11 +101,10 @@ class EmePacker:
             
             key = bytes.fromhex(archive_info['key'])
             entries = archive_info['entries']
-            entries.sort(key=lambda x: x['name'])
             
             processed_entries = []
             file_data = []
-            current_offset = 4
+            current_offset = 8
             
             for entry in entries:
                 input_path = os.path.join(input_dir, entry['name'])
@@ -102,37 +115,48 @@ class EmePacker:
                 with open(input_path, 'rb') as f:
                     data = f.read()
                 
+                # Handle different file types
                 if entry['sub_type'] == 3:
-                    processed_data = self._pack_script(data, entry)
+                    processed_data = self._pack_script(data, entry, key)
+                # elif entry['sub_type'] == 4:
+                    # processed_data = self._pack_bmp(data, entry, key)
                 elif entry['sub_type'] == 5 and len(data) > 4:
                     processed_data = self._pack_type5(data, key)
                 else:
-                    processed_data = data
+                    processed_data = data  # Default case
                 
                 entry_copy = entry.copy()
                 entry_copy['offset'] = current_offset
-                entry_copy['size'] = len(processed_data)
+                entry_copy['packed_size'] = len(processed_data)
                 processed_entries.append(entry_copy)
                 
                 file_data.append(processed_data)
                 current_offset += len(processed_data)
             
+            # Build index entries - FIXED VERSION
             index = bytearray()
             for entry in processed_entries:
+                # Reverse LZSS init pos correction before writing
+                lzss_init_pos = entry['lzss_init_pos']
+                if entry['lzss_frame_size'] != 0:
+                    lzss_init_pos = (entry['lzss_frame_size'] - lzss_init_pos) % entry['lzss_frame_size']
+                
                 entry_data = bytearray(0x60)
                 name_bytes = entry['name'].encode('ascii')
-                entry_data[0:len(name_bytes)] = name_bytes
+
+                struct.pack_into("64s", entry_data, 0x00, name_bytes)
                 struct.pack_into("<H", entry_data, 0x40, entry['lzss_frame_size'])
-                struct.pack_into("<H", entry_data, 0x42, entry['lzss_init_pos'])
-                struct.pack_into("<I", entry_data, 0x48, entry['sub_type'])
-                struct.pack_into("<I", entry_data, 0x4C, entry['size'])
+                struct.pack_into("<H", entry_data, 0x42, lzss_init_pos)
+                struct.pack_into("<I", entry_data, 0x44, entry['magic'])  # ADDED THIS
+                struct.pack_into("<H", entry_data, 0x48, entry['sub_type'])  # Changed from <I to <H
+                struct.pack_into("<I", entry_data, 0x4C, entry['packed_size'])
                 struct.pack_into("<I", entry_data, 0x50, entry['unpacked_size'])
                 struct.pack_into("<I", entry_data, 0x54, entry['offset'])
-                
-                encrypted_entry = self.encrypt(entry_data, 0, 0x60, key)
-                transformed_entry = self.apply_xor_mask(encrypted_entry)
-                index.extend(transformed_entry)
+
+                encrypted_entry = self.encrypt(entry_data, 0, len(entry_data), key)
+                index.extend(encrypted_entry)  # Use encrypted entry
             
+            # Write archive
             with open(output_path, 'wb') as archive:
                 archive.write(self.signature)
                 for data in file_data:
@@ -147,28 +171,44 @@ class EmePacker:
             
         except Exception as e:
             print(f"Error creating archive: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
 
-    def _pack_script(self, data: bytes, entry: Dict) -> bytes:
+    def _pack_script(self, data: bytes, entry: Dict, key: bytes) -> bytes:
+        """Pack script files (sub_type 3) with optional compression"""
+        header = bytearray(12)
+        
         if not entry['lzss_frame_size']:
-            header = bytearray(12)
+            # No compression case
             struct.pack_into("<I", header, 0, 0)
             struct.pack_into("<I", header, 4, len(data))
             struct.pack_into("<I", header, 8, 0)
-            return header + data
+            encrypted_header = self.encrypt(header, 0, len(header), key)
+            return encrypted_header + data
         
-        compressed_data, error = compress(data)
-        if error != LZSSError.OK:
-            raise RuntimeError(f"LZSS compression failed for {entry['name']}")
+        # Compression case
+        buffer_size = len(data) * 2 + 1024
         
-        header = bytearray(12)
-        struct.pack_into("<I", header, 0, len(compressed_data))
-        struct.pack_into("<I", header, 4, len(data))
-        struct.pack_into("<I", header, 8, 1)
+        try:
+            compressed_data = lzss.encode(data, buffer_size)
+        except RuntimeError as e:
+            print(f"LZSS compression failed for {entry.get('name', 'unknown')}: {e}")
+            raise
         
-        return header + compressed_data
-
+        if not compressed_data:
+            raise RuntimeError(f"LZSS compression returned empty data for {entry.get('name', 'unknown')}")
+        
+        # SET THE HEADER FIELDS FOR COMPRESSED DATA
+        # struct.pack_into("<I", header, 0, len(compressed_data))
+        # struct.pack_into("<I", header, 4, len(data))
+        # struct.pack_into("<I", header, 8, 1)  # Compression flag
+        
+        encrypted_header = self.encrypt(header, 0, len(header), key)
+        return encrypted_header + compressed_data
+        
     def _pack_type5(self, data: bytes, key: bytes) -> bytes:
+        """Pack type 5 files (only first 4 bytes encrypted)"""
         header = bytearray(data[:4])
         encrypted_header = self.encrypt(header, 0, 4, key)
         return encrypted_header + data[4:]
