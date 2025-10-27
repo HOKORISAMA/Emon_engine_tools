@@ -1,305 +1,202 @@
 import os
 import struct
 import sys
+import json
 from io import BytesIO
+import lzss
 
-class EmeOpener:
-    def __init__(self):
-        self.tag = "EME"
-        self.description = "Emon Engine resource archive"
-        self.signature = 0x44455252  # 'RREDATA'
-        self.is_hierarchic = False
-        self.can_write = True
-        self.extensions = ["eme", "rre"]
 
-    def try_open(self, file_path):
-        with open(file_path, "rb") as f:
+class EmeArchive:
+    def __init__(self, path):
+        self.path = path
+        self.entries = []
+        self.key = None
+        self._load()
+
+    def _load(self):
+        with open(self.path, "rb") as f:
+            # Check signature
             if f.read(4) != b"RRED":
-                return None
-            
-            f.seek(-4, 2)
-            count = struct.unpack("<I", f.read(4))[0]
-            if not self.is_sane_count(count):
-                return None
+                raise ValueError("Invalid archive signature")
 
+            # Read entry count from end of file
+            f.seek(-4, os.SEEK_END)
+            count = struct.unpack("<I", f.read(4))[0]
+            if not 0 < count < 100000:
+                raise ValueError(f"Invalid entry count: {count}")
+
+            # Read key and index
             index_size = count * 0x60
             index_offset = f.tell() - 4 - index_size
             f.seek(index_offset - 40)
-            key = f.read(40)
+            self.key = f.read(40)
             f.seek(index_offset)
             index = bytearray(f.read(index_size))
 
-        dir_entries = []
+        # Parse entries
         for i in range(count):
             offset = i * 0x60
-            self.decrypt(index, offset, 0x60, key)
-            name = self.get_c_string(index[offset:offset+0x40])
-            entry = EmEntry(name)
-            entry.lzss_frame_size = struct.unpack_from("<H", index, offset + 0x40)[0]
-            entry.lzss_init_pos = struct.unpack_from("<H", index, offset + 0x42)[0]
-            if entry.lzss_frame_size != 0:
-                entry.lzss_init_pos = (entry.lzss_frame_size - entry.lzss_init_pos) % entry.lzss_frame_size
-            entry.sub_type = struct.unpack_from("<I", index, offset + 0x48)[0]
-            entry.size = struct.unpack_from("<I", index, offset + 0x4C)[0]
-            entry.unpacked_size = struct.unpack_from("<I", index, offset + 0x50)[0]
-            entry.offset = struct.unpack_from("<I", index, offset + 0x54)[0]
-            entry.is_packed = entry.unpacked_size != entry.size
-            if not entry.check_placement(os.path.getsize(file_path)):
-                return None
-            if entry.sub_type == 3:
-                entry.type = "script"
-            elif entry.sub_type == 4:
-                entry.type = "image"
-            dir_entries.append(entry)
+            self._decrypt(index, offset, 0x60)
 
-        return EmeArchive(file_path, self, dir_entries, key)
+            name = index[offset:offset + 0x40].split(b'\0', 1)[0].decode('ascii')
+            lzss_frame_size = struct.unpack_from("<H", index, offset + 0x40)[0]
+            lzss_init_pos = struct.unpack_from("<H", index, offset + 0x42)[0]
 
-    def open_entry(self, arc, entry):
-        if isinstance(entry, EmEntry) and isinstance(arc, EmeArchive):
-            if entry.sub_type == 3:
-                return self.open_script(arc, entry)
-            elif entry.sub_type == 5 and entry.size > 4:
-                return self.open_t5(arc, entry)
-        
-        with open(arc.file_path, "rb") as f:
-            f.seek(entry.offset)
-            return BytesIO(f.read(entry.size))
+            if lzss_frame_size != 0:
+                lzss_init_pos = (lzss_frame_size - lzss_init_pos) % lzss_frame_size
 
-    def open_script(self, arc, entry):
-        with open(arc.file_path, "rb") as f:
-            f.seek(entry.offset)
-            header = bytearray(f.read(12))
-        self.decrypt(header, 0, 12, arc.key)
-        
-        if entry.lzss_frame_size == 0:
-            with open(arc.file_path, "rb") as f:
-                f.seek(entry.offset + 12)
-                input_data = f.read(entry.size - 12)
-            return BytesIO(header + input_data)
-        
-        unpacked_size = struct.unpack_from("<I", header, 4)[0]
-        if unpacked_size != 0 and unpacked_size < entry.unpacked_size:
-            packed_size = struct.unpack_from("<I", header, 0)[0]
-            part1_size = entry.unpacked_size - unpacked_size
-            data = bytearray(entry.unpacked_size)
-            
-            with open(arc.file_path, "rb") as f:
-                f.seek(entry.offset + 12 + packed_size)
-                lzss = LzssStream(BytesIO(f.read(entry.size - 12 - packed_size)))
-                lzss.config.frame_size = entry.lzss_frame_size
-                lzss.config.frame_init_pos = entry.lzss_init_pos
-                data[:part1_size] = lzss.read(part1_size)
-                
-                f.seek(entry.offset + 12)
-                lzss = LzssStream(BytesIO(f.read(packed_size)))
-                lzss.config.frame_size = entry.lzss_frame_size
-                lzss.config.frame_init_pos = entry.lzss_init_pos
-                data[part1_size:] = lzss.read(unpacked_size)
-            
-            return BytesIO(data)
-        else:
-            with open(arc.file_path, "rb") as f:
-                f.seek(entry.offset + 12)
-                lzss = LzssStream(BytesIO(f.read(entry.size - 12)))
-                lzss.config.frame_size = entry.lzss_frame_size
-                lzss.config.frame_init_pos = entry.lzss_init_pos
-                return lzss
+            entry = {
+                'name': name,
+                'sub_type': struct.unpack_from("<I", index, offset + 0x48)[0],
+                'magic' : struct.unpack_from("<H", index, offset + 0x44)[0],
+                'packed_size': struct.unpack_from("<I", index, offset + 0x4C)[0],
+                'unpacked_size': struct.unpack_from("<I", index, offset + 0x50)[0],
+                'offset': struct.unpack_from("<I", index, offset + 0x54)[0],
+                'lzss_frame_size': lzss_frame_size,
+                'lzss_init_pos': lzss_init_pos,
+            }
+            entry['is_packed'] = entry['unpacked_size'] != entry['packed_size']
 
-    def open_t5(self, arc, entry):
-        with open(arc.file_path, "rb") as f:
-            f.seek(entry.offset)
-            header = bytearray(f.read(4))
-        self.decrypt(header, 0, 4, arc.key)
-        
-        with open(arc.file_path, "rb") as f:
-            f.seek(entry.offset + 4)
-            input_data = f.read(entry.size - 4)
-        
-        return BytesIO(header + input_data)
+            if entry['offset'] + entry['packed_size'] > os.path.getsize(self.path):
+                raise ValueError(f"Entry {name} extends beyond file")
 
-    @staticmethod
-    def decrypt(buffer, offset, length, routine):
-        data = memoryview(buffer)[offset:offset+length]
-        key_index = len(routine)
+            self.entries.append(entry)
+
+    def _decrypt(self, buffer, offset, length):
+        data = memoryview(buffer)[offset:offset + length]
+        key_index = len(self.key)
+
         for i in range(7, -1, -1):
             key_index -= 4
-            key = struct.unpack_from("<I", routine, key_index)[0]
-            if routine[i] == 1:
+            key = struct.unpack_from("<I", self.key, key_index)[0]
+
+            if self.key[i] == 1:
                 for j in range(0, len(data), 4):
-                    struct.pack_into("<I", data, j, struct.unpack_from("<I", data, j)[0] ^ key)
-            elif routine[i] == 2:
+                    val = struct.unpack_from("<I", data, j)[0]
+                    struct.pack_into("<I", data, j, val ^ key)
+
+            elif self.key[i] == 2:
                 for j in range(0, len(data), 4):
-                    v = struct.unpack_from("<I", data, j)[0]
-                    struct.pack_into("<I", data, j, v ^ key)
-                    key = v
-            elif routine[i] == 4:
+                    val = struct.unpack_from("<I", data, j)[0]
+                    struct.pack_into("<I", data, j, val ^ key)
+                    key = val
+
+            elif self.key[i] == 4:
                 for j in range(0, len(data), 4):
-                    v = struct.unpack_from("<I", data, j)[0]
-                    struct.pack_into("<I", data, j, EmeOpener.shift_value(v, key))
-            elif routine[i] == 8:
-                EmeOpener.init_table(data, key)
+                    val = struct.unpack_from("<I", data, j)[0]
+                    shift = 0
+                    result = 0
+                    for k in range(32):
+                        shift += key
+                        result |= ((val >> k) & 1) << (shift % 32)
+                    struct.pack_into("<I", data, j, result)
 
-    @staticmethod
-    def shift_value(val, key):
-        shift = 0
-        result = 0
-        for i in range(32):
-            shift += key
-            result |= ((val >> i) & 1) << (shift % 32)
-        return result
+            elif self.key[i] == 8:
+                table = bytearray(len(data))
+                x = 0
+                for k in range(len(data)):
+                    x = (x + key) % len(data)
+                    table[x] = data[k]
+                data[:] = table
 
-    @staticmethod
-    def init_table(buffer, key):
-        length = len(buffer)
-        table = bytearray(length)
-        x = 0
-        for i in range(length):
-            x = (x + key) % length
-            table[x] = buffer[i]
-        buffer[:] = table
+    def extract(self, entry):
+        with open(self.path, "rb") as f:
+            # Read and decrypt 12-byte header
+            f.seek(entry['offset'])
+            header = bytearray(f.read(12))
+            self._decrypt(header, 0, 12)
 
-    @staticmethod
-    def is_sane_count(count):
-        return 0 < count < 100000
+            # Case A — no compression
+            if entry['lzss_frame_size'] == 0:
+                f.seek(entry['offset'] + 12)
+                raw = f.read(entry['packed_size'])
+                return BytesIO(header + raw)
 
-    @staticmethod
-    def get_c_string(buffer):
-        return buffer.split(b'\0', 1)[0].decode('ascii')
+            # Read part2 unpacked size
+            part2_unpacked_size = struct.unpack_from("<I", header, 4)[0]
 
-class EmEntry:
-    def __init__(self, name):
-        self.name = name
-        self.lzss_frame_size = 0
-        self.lzss_init_pos = 0
-        self.sub_type = 0
-        self.size = 0
-        self.unpacked_size = 0
-        self.offset = 0
-        self.is_packed = False
-        self.type = ""
+            # Case B — split compression
+            if part2_unpacked_size != 0 and part2_unpacked_size < entry['unpacked_size']:
+                packed_size = struct.unpack_from("<I", header, 0)[0]
 
-    def check_placement(self, max_offset):
-        return self.offset + self.size <= max_offset
+                f.seek(entry['offset'] + 12)
+                # Read part2 first (smaller part), then part1 (main part)
+                part2_compressed = f.read(packed_size)
+                part1_compressed = f.read(entry['packed_size'])
+                
+                # Decompress in the same order as C# code
+                part2_data = lzss.decode(part2_compressed, part2_unpacked_size)
+                part1_data = lzss.decode(part1_compressed, entry['unpacked_size'])
 
-class EmeArchive:
-    def __init__(self, file_path, impl, dir_entries, key):
-        self.file_path = file_path
-        self.impl = impl
-        self.dir = dir_entries
-        self.key = key
+                # Combine in correct order (part1 + part2)
+                combined = part1_data + part2_data
+                return BytesIO(combined)
 
-class LzssStream:
-    def __init__(self, input_stream):
-        self.input_stream = input_stream
-        self.config = LzssSettings()
-        self.buffer = bytearray(4096)
-        self.buffer_pos = 0
-        self.buffer_length = 0
-        self.window = bytearray(self.config.frame_size)
-        self.window_pos = self.config.frame_init_pos
+            # Case C — normal compression (single part)
+            f.seek(entry['offset'] + 12)
+            compressed = f.read(entry['packed_size'])
+            data = lzss.decode(compressed, entry['unpacked_size'])
+            return BytesIO(data)
 
-    def read(self, count):
-        result = bytearray()
-        while count > 0:
-            if self.buffer_pos >= self.buffer_length:
-                if not self.fill_buffer():
-                    break
-            to_copy = min(self.buffer_length - self.buffer_pos, count)
-            result.extend(self.buffer[self.buffer_pos:self.buffer_pos+to_copy])
-            self.buffer_pos += to_copy
-            count -= to_copy
-        return bytes(result)
+    def save_metadata(self, output_dir):
+        metadata = {
+            "key": self.key.hex().upper(),
+            "entries": [
+                {
+                    "name": e['name'],
+                    "path": "",
+                    "offset": e['offset'],
+                    "packed_size": e['packed_size'],
+                    "unpacked_size": e['unpacked_size'],
+                    "lzss_frame_size": e['lzss_frame_size'],
+                    "lzss_init_pos": e['lzss_init_pos'],
+                    "sub_type": e['sub_type'],
+                    "magic" : e['magic'],
+                    "is_packed": e['is_packed']
+                }
+                for e in self.entries
+            ]
+        }
 
-    def fill_buffer(self):
-        self.buffer_pos = 0
-        self.buffer_length = 0
+        with open(os.path.join(output_dir, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
 
-        flags = self.input_stream.read(1)
-        if not flags:
-            return False
-        flags = flags[0]
+    def extract_all(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        self.save_metadata(output_dir)
+        print(f"Created metadata.json")
 
-        for i in range(8):
-            if self.buffer_length >= len(self.buffer):
-                break
+        for entry in self.entries:
+            stream = self.extract(entry)
+            output_path = os.path.join(output_dir, entry['name'])
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-            if flags & (1 << i) == 0:
-                data = self.input_stream.read(2)
-                if len(data) < 2:
-                    break  # Not enough data to continue
+            with open(output_path, "wb") as f:
+                f.write(stream.read())
 
-                b1, b2 = data
-                offset = ((b2 & 0xF0) << 4) | b1
-                length = (b2 & 0x0F) + 3
+            print(f"Extracted: {entry['name']}")
 
-                for j in range(length):
-                    if self.buffer_length >= len(self.buffer):
-                        break
-                    b = self.window[(offset + j) % self.config.frame_size]
-                    self.buffer[self.buffer_length] = b
-                    self.buffer_length += 1
-                    self.window[self.window_pos] = b
-                    self.window_pos = (self.window_pos + 1) % self.config.frame_size
-            else:
-                b = self.input_stream.read(1)
-                if not b:
-                    break
-                b = b[0]
-                self.buffer[self.buffer_length] = b
-                self.buffer_length += 1
-                self.window[self.window_pos] = b
-                self.window_pos = (self.window_pos + 1) % self.config.frame_size
-
-        return self.buffer_length > 0
-
-class LzssSettings:
-    def __init__(self):
-        self.frame_size = 0x1000
-        self.frame_fill = 0
-        self.frame_init_pos = 0xFEE
-
-def close_stream(stream):
-    if hasattr(stream, 'close'):
-        stream.close()
-    elif isinstance(stream, BytesIO):
-        stream.close()
 
 def main():
     if len(sys.argv) != 3:
         print("Usage: python eme_opener.py <archive_path> <output_directory>")
-        return
+        sys.exit(1)
 
     archive_path = sys.argv[1]
-    output_directory = sys.argv[2]
+    output_dir = sys.argv[2]
 
     if not os.path.exists(archive_path):
         print(f"Archive file not found: {archive_path}")
-        return
+        sys.exit(1)
 
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
+    try:
+        archive = EmeArchive(archive_path)
+        archive.extract_all(output_dir)
+        print("Extraction completed.")
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
-    opener = EmeOpener()
-    arc_file = opener.try_open(archive_path)
-    if arc_file is None:
-        print("Failed to open the archive.")
-        return
-
-    for entry in arc_file.dir:
-        output_path = os.path.join(output_directory, entry.name)
-        entry_stream = opener.open_entry(arc_file, entry)
-        try:
-            with open(output_path, "wb") as output_file:
-                while True:
-                    chunk = entry_stream.read(8192)  # Read in 8KB chunks
-                    if not chunk:
-                        break
-                    output_file.write(chunk)
-            print(f"Extracted: {entry.name}")
-        finally:
-            close_stream(entry_stream)
-
-    print("Extraction completed.")
 
 if __name__ == "__main__":
     main()
